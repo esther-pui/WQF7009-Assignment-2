@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import torch.optim as optim
 import copy
 import pandas as pd 
+import os
 
 # Set GPU device
 print(torch.cuda.is_available())
@@ -16,8 +17,8 @@ device = torch.device("cuda:0")
 
 
 # %% Load data
-TRAIN_ROOT = "data/brain_mri/training"
-TEST_ROOT = "data/brain_mri/testing"
+TRAIN_ROOT = "data/brain_mri/Training"
+TEST_ROOT = "data/brain_mri/Testing"
 train_dataset = torchvision.datasets.ImageFolder(root=TRAIN_ROOT)
 test_dataset = torchvision.datasets.ImageFolder(root=TRAIN_ROOT)
 
@@ -36,7 +37,21 @@ class CNNModel(nn.Module):
         x = self.vgg16(x)
         return x
 
+# model = CNNModel()
+# model.to(device)
+# model
+
 model = CNNModel()
+model_save_path = 'brain_mri_vgg16_weights.pth'
+
+if os.path.exists(model_save_path):
+    print("Loading saved model weights.")
+    # Load the state_dict onto the correct device (CPU/GPU)
+    model.load_state_dict(torch.load(model_save_path, map_location=device))
+    model.eval() # Important: Sets the model to inference mode
+else:
+    print("No saved weights found. Model will be trained now.")
+    
 model.to(device)
 model
 
@@ -90,6 +105,11 @@ for epoch in range(epochs):
         loss.backward()
         optimizer.step()
         print(loss)
+
+
+model_save_path = 'brain_mri_vgg16_weights.pth'
+torch.save(model.state_dict(), model_save_path)
+print(f"Model weights saved to {model_save_path}")
 
 # %% Inspect predictions for first batch
 import pandas as pd

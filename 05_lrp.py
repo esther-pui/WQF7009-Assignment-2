@@ -42,7 +42,8 @@ class CNNModel(nn.Module):
 # model
 
 model = CNNModel()
-model_save_path = 'brain_mri_vgg16_weights.pth'
+# save to gdrive
+model_save_path = '/content/gdrive/MyDrive/UM Master 2025/SEM 1 (2025 Oct)/WQF7009 EXPLAINABLE ARTIFICIAL INTELLIGENCE (XAI)/A2/brain_mri_vgg16_weights.pth'
 
 if os.path.exists(model_save_path):
     print("Loading saved model weights.")

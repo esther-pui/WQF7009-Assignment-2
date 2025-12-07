@@ -10,10 +10,11 @@ import torch.optim as optim
 import copy
 import pandas as pd 
 import os
+import cv2
 
 # Set GPU device
 print(torch.cuda.is_available())
-device = torch.device("cuda:0")
+# device = torch.device("cuda:0")
 
 
 # %% Load data
@@ -28,6 +29,11 @@ class CNNModel(nn.Module):
     def __init__(self):
         super(CNNModel, self).__init__()
         self.vgg16 = models.vgg16(pretrained=True) 
+
+        # Disable inplace ReLU for XAI Hooks
+        for module in self.vgg16.features.modules():
+            if isinstance(module, nn.ReLU):
+                module.inplace = False
 
         # Replace output layer according to our problem
         in_feats = self.vgg16.classifier[6].in_features 
@@ -45,13 +51,24 @@ model = CNNModel()
 # save to gdrive
 model_save_path = '/content/gdrive/MyDrive/UM Master 2025/SEM 1 (2025 Oct)/WQF7009 EXPLAINABLE ARTIFICIAL INTELLIGENCE (XAI)/A2/brain_mri_vgg16_weights.pth'
 
+# if os.path.exists(model_save_path):
+#     print("Loading saved model weights.")
+#     # Load the state_dict onto the correct device (CPU/GPU)
+#     model.load_state_dict(torch.load(model_save_path, map_location=device))
+#     model.eval() # Important: Sets the model to inference mode
+# else:
+#     print("No saved weights found. Model will be trained now.")
+
+# use cpu instead
 if os.path.exists(model_save_path):
-    print("Loading saved model weights.")
-    # Load the state_dict onto the correct device (CPU/GPU)
-    model.load_state_dict(torch.load(model_save_path, map_location=device))
+    print("Loading saved model weights to CPU.")
+    # Explicitly map the CUDA-saved weights to the CPU device
+    model.load_state_dict(torch.load(model_save_path, map_location=torch.device('cpu'))) 
     model.eval() # Important: Sets the model to inference mode
-else:
-    print("No saved weights found. Model will be trained now.")
+
+# NOTE: You must also change your global device variable:
+device = torch.device("cpu") # Set the global device to CPU
+model.to(device)
     
 model.to(device)
 model
@@ -88,29 +105,28 @@ test_loader = torch.utils.data.DataLoader(
     shuffle=True
 )
 
-# %% Train
-cross_entropy_loss = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=0.00001)
-epochs = 10
+# %% Train (replace with pth file so dont have to run everytime)
+# cross_entropy_loss = nn.CrossEntropyLoss()
+# optimizer = optim.Adam(model.parameters(), lr=0.00001)
+# epochs = 10
 
-# Iterate x epochs over the train data
-for epoch in range(epochs):  
-    for i, batch in enumerate(train_loader, 0):
-        inputs, labels = batch
-        inputs = inputs.to(device)
-        labels = labels.to(device)
-        optimizer.zero_grad()
-        outputs = model(inputs)
-        # Labels are automatically one-hot-encoded
-        loss = cross_entropy_loss(outputs, labels)
-        loss.backward()
-        optimizer.step()
-        print(loss)
+# # Iterate x epochs over the train data
+# for epoch in range(epochs):  
+#     print(f"--- Starting Epoch {epoch + 1}/{epochs} ---")
+#     for i, batch in enumerate(train_loader, 0):
+#         inputs, labels = batch
+#         inputs = inputs.to(device)
+#         labels = labels.to(device)
+#         optimizer.zero_grad()
+#         outputs = model(inputs)
+#         # Labels are automatically one-hot-encoded
+#         loss = cross_entropy_loss(outputs, labels)
+#         loss.backward()
+#         optimizer.step()
+#         print(loss)
 
-
-model_save_path = 'brain_mri_vgg16_weights.pth'
-torch.save(model.state_dict(), model_save_path)
-print(f"Model weights saved to {model_save_path}")
+# torch.save(model.state_dict(), model_save_path)
+# print(f"Model weights saved to {model_save_path}")
 
 # %% Inspect predictions for first batch
 import pandas as pd
@@ -191,8 +207,10 @@ def apply_lrp_on_vgg16(model, image):
     # >>> Step 3: Replace last layer with one-hot-encoding
     output_activation = activations[-1].detach().cpu().numpy()
     max_activation = output_activation.max()
-    one_hot_output = [val if val == max_activation else 0 
-                        for val in output_activation[0]]
+    one_hot_output = [val[0][0] if val[0][0] == max_activation else 0.0 for val in output_activation[0]]
+
+    # one_hot_output = [val if val == max_activation else 0 
+    #                     for val in output_activation[0]]
 
     activations[-1] = torch.FloatTensor([one_hot_output]).to(device)
 
@@ -236,7 +254,7 @@ def apply_lrp_on_vgg16(model, image):
 
 # %%
 # Calculate relevances for first image in this test batch
-image_id = 31
+image_id = 12
 image_relevances = apply_lrp_on_vgg16(model, inputs[image_id])
 image_relevances = image_relevances.permute(0,2,3,1).detach().cpu().numpy()[0]
 image_relevances = np.interp(image_relevances, (image_relevances.min(),
@@ -255,8 +273,122 @@ if outputs[image_id] == labels[image_id]:
     plt.imshow(image_relevances[:,:,0], cmap="seismic")
     plt.subplot(1,2,2)
     plt.imshow(inputs[image_id].permute(1,2,0).detach().cpu().numpy())
+    print(f"--- Plot Generated for image_id: {image_id} ---")
     plt.show()
 else:
     print("This image is not classified correctly.")
 
 # %%
+# %% Grad-CAM Implementation
+class GradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.feature_maps = None
+        self.gradients = None
+        
+        # 1. Register forward hook to capture feature maps
+        self.target_layer.register_forward_hook(self.save_feature_maps)
+        
+        # 2. Register backward hook to capture gradients
+        self.target_layer.register_full_backward_hook(self.save_gradients)
+
+    def save_feature_maps(self, module, input, output):
+        # Detach and save the feature maps (activations)
+        self.feature_maps = output.detach()
+
+    def save_gradients(self, module, grad_input, grad_output):
+        # Detach and save the gradients flowing back
+        self.gradients = grad_output[0].detach()
+
+    def __call__(self, input_tensor, target_class=None):
+        # Clear previous gradients
+        self.model.zero_grad()
+        
+        # Forward pass
+        output = self.model(input_tensor)
+        
+        # Determine the target class if not specified (use the predicted class)
+        if target_class is None:
+            target_class = output.argmax(dim=1).item()
+        
+        # Calculate loss (relevant score) for the target class
+        target_score = output[:, target_class].sum()
+        
+        # Backward pass
+        target_score.backward()
+        
+        # Get the global average of the gradients (Alpha weights)
+        # Dimensions: [batch_size, channels, height, width]
+        weights = torch.mean(self.gradients, dim=[0, 2, 3], keepdim=True) 
+        
+        # Combine weighted gradients (Alpha) and feature maps
+        cam = torch.sum(weights * self.feature_maps, dim=1, keepdim=True)
+        
+        # ReLU operation (only positive influence matters)
+        cam = torch.relu(cam)
+        
+        # Normalize the heatmap (resize to input size later)
+        cam = cam.squeeze(0).cpu().numpy()
+        cam = cam / cam.max() if cam.max() else cam
+        
+        return cam
+
+# ----------------------------------------------------
+# Grad-CAM Visualization Function
+# ----------------------------------------------------
+def visualize_grad_cam(cam, image_tensor):
+    # Rescale CAM to input image dimensions (255x255)
+    heatmap = cv2.resize(cam[0], (image_tensor.shape[2], image_tensor.shape[1]))
+    
+    # Normalize and convert to 3-channel image for overlay
+    heatmap = np.uint8(255 * heatmap)
+    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+    
+    # Convert input tensor to numpy image and normalize (0-255)
+    image_np = image_tensor.permute(1, 2, 0).cpu().numpy()
+    image_np = np.uint8(255 * image_np / image_np.max())
+    
+    # Create the overlay
+    # Use 0.4 as opacity for the heatmap
+    overlay_img = cv2.addWeighted(image_np, 0.6, heatmap, 0.4, 0)
+    
+    # Convert from BGR (OpenCV default) to RGB for Matplotlib
+    overlay_img = cv2.cvtColor(overlay_img, cv2.COLOR_BGR2RGB)
+    
+    return overlay_img
+
+# %% Grad-CAM Execution
+
+# 1. Select the target convolutional layer (VGG16 features list)
+# VGG16's last convolutional layer before the max pool is usually index 28 or 30 (use 28 for PyTorch defaults)
+# The index needs to be confirmed based on your model printout.
+target_conv_layer = model.vgg16.features[28] 
+grad_cam_instance = GradCAM(model, target_conv_layer)
+
+# 2. Get the same image used for LRP (image_id=31)
+input_tensor = torch.unsqueeze(inputs[image_id].to(device), 0)
+
+# 3. Generate the Grad-CAM heatmap
+grad_cam_heatmap = grad_cam_instance(input_tensor)
+
+# 4. Visualize the result
+grad_cam_visual = visualize_grad_cam(grad_cam_heatmap, inputs[image_id])
+
+# 5. Plotting (Run this in a cell to see the result)
+plt.figure(figsize=(15, 5))
+plt.subplot(1, 3, 1)
+plt.title(f"Original Image: {pred_label}")
+plt.imshow(inputs[image_id].permute(1, 2, 0).cpu().numpy())
+plt.axis('off')
+
+plt.subplot(1, 3, 2)
+plt.title("LRP Relevance")
+plt.imshow(image_relevances[:,:,0], cmap="seismic")
+plt.axis('off')
+
+plt.subplot(1, 3, 3)
+plt.title("Grad-CAM Heatmap")
+plt.imshow(grad_cam_visual)
+plt.axis('off')
+plt.show()
